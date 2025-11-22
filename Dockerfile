@@ -19,4 +19,4 @@ COPY . .
 EXPOSE 8080
 ENV UVICORN_WORKERS=1
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8080 --workers $UVICORN_WORKERS"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers $UVICORN_WORKERS"]
