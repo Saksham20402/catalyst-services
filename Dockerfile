@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
@@ -9,12 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 ENV EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2
-RUN python3 - <<EOF
-from sentence_transformers import SentenceTransformer
-print("Preloading model:", "${EMBED_MODEL}")
-SentenceTransformer("${EMBED_MODEL}")
-print("Model downloaded successfully.")
-EOF
+RUN python3 -c "import os; from sentence_transformers import SentenceTransformer; 
+model = os.getenv('EMBED_MODEL'); print(f'Preloading model: {model}'); 
+SentenceTransformer(model)"
 COPY . .
 EXPOSE 8080
 ENV UVICORN_WORKERS=1
