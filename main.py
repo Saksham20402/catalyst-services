@@ -117,3 +117,4 @@ def embed(req: EmbedRequest):
     dim = len(embeddings[0]) if embeddings else 0
 
     return EmbedResponse(embeddings=embeddings, model=MODEL_NAME, dim=dim)
+
