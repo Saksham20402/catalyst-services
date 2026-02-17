@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
 
     try:
         log.info(">>> Loading SentenceTransformer...")
-        _model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+        _model = SentenceTransformer(MODEL_NAME, device=DEVICE, token=os.getenv("HF_TOKEN"))
         log.info(">>> Model loaded successfully")
 
         log.info(">>> Warmup: encoding dummy text")
