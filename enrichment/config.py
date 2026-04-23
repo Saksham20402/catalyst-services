@@ -26,3 +26,9 @@ SKIP_ENRICHED: bool = os.getenv("SKIP_ENRICHED", "true").lower() == "true"
 
 # File used to persist batch offset across runs (relative to CWD)
 PROGRESS_FILE: str = os.getenv("PROGRESS_FILE", ".enrichment_progress.json")
+
+SUPABASE_HOST = os.getenv("DB_HOST")
+SUPABASE_PORT = os.getenv("PORT")
+SUPABASE_PASSWORD = os.getenv("PASSWORD")
+SUPABASE_USER = os.getenv("USER")
+DB_NAME = os.getenv("DB_NAME")
