@@ -1,34 +1,47 @@
 import json
 import logging
+import time
 
 import httpx
 
-from enrichment.config import OLLAMA_BASE_URL, OLLAMA_MODEL
+from enrichment.config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_MAX_RETRIES
 
 log = logging.getLogger(__name__)
 
-_PROMPT_TEMPLATE = """\
-You are an expert exam question analyst. Analyse the question below and respond ONLY with valid JSON — no markdown, no extra text.
+# Shared client — reuses the TCP connection across all LLM calls (eliminates
+# per-request handshake overhead; critical when processing hundreds of questions)
+_http = httpx.Client(
+    base_url=OLLAMA_BASE_URL,
+    timeout=OLLAMA_TIMEOUT,
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
 
-{context_block}
+# Lean prompt: no unused fields (relevance_reason, difficulty_correct removed).
+# Asking the model to independently assess difficulty — not to "validate" a label —
+# avoids anchoring bias and always gives us a fresh AI-rated difficulty to store.
+_PROMPT = """\
+You are an exam question analyst. Return ONLY valid JSON — no markdown, no extra text.
+
 Subject: {subject}
 Topic: {topic}
-Difficulty: {difficulty}
 Question: {text}
 Options: {options}
-Correct Answer: {correct_answer}
+Correct answer: {correct_answer}
 
-Return this exact JSON structure:
+Respond with this exact JSON:
 {{
-  "explanation": "Step-by-step explanation of why the correct answer is right and why the others are wrong.",
-  "difficulty_correct": true or false,
-  "difficulty_suggested": "easy | medium | hard",
-  "is_relevant": true or false,
-  "relevance_reason": "One sentence on whether this question fits real exam patterns for the subject."
-}}"""
+  "explanation": "<step-by-step explanation of why the correct answer is right and each wrong option is incorrect — clear enough for a student who picked the wrong answer>",
+  "difficulty": "easy|medium|hard"
+}}
+
+Difficulty rules:
+- easy   = single concept, directly stated in the question
+- medium = requires applying or combining two concepts
+- hard   = requires multi-step reasoning, subtle distinctions, or deep domain knowledge
+"""
 
 
-def _build_prompt(q: dict, context: str) -> str:
+def _build_prompt(q: dict, context: str = "") -> str:
     options = q.get("options", [])
     correct_index = q.get("correct_index")
     try:
@@ -36,38 +49,57 @@ def _build_prompt(q: dict, context: str) -> str:
     except (IndexError, TypeError, ValueError):
         correct_answer = str(correct_index)
 
-    context_block = f"Web context: {context}\n" if context else ""
-
-    return _PROMPT_TEMPLATE.format(
-        context_block=context_block,
+    prompt = _PROMPT.format(
         subject=q.get("subject", "General"),
         topic=q.get("topic", ""),
-        difficulty=q.get("difficulty", "medium"),
         text=q.get("text", ""),
         options=", ".join(f"{i}. {o}" for i, o in enumerate(options)) if isinstance(options, list) else str(options),
         correct_answer=correct_answer,
     )
 
+    if context:
+        prompt = f"Background context: {context}\n\n" + prompt
+
+    return prompt
+
 
 def enrich_with_ollama(q: dict, context: str = "") -> dict:
-    """Call local Ollama and return the parsed enrichment dict, or {} on failure."""
+    """
+    Call local Ollama and return the parsed enrichment dict, or {} on failure.
+    Retries up to OLLAMA_MAX_RETRIES times with exponential back-off.
+    """
     prompt = _build_prompt(q, context)
-    try:
-        response = httpx.post(
-            f"{OLLAMA_BASE_URL}/api/generate",
-            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"},
-            timeout=120.0,
-        )
-        response.raise_for_status()
-        raw = response.json().get("response", "")
-        return json.loads(raw)
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:200]
-        log.error(f"Ollama HTTP {e.response.status_code} for id={q.get('id')}: {body}")
-        if e.response.status_code == 404:
-            log.error(f"  → Model '{OLLAMA_MODEL}' not found. Run: ollama pull {OLLAMA_MODEL}")
-    except httpx.RequestError as e:
-        log.error(f"Ollama connection error for id={q.get('id')}: {e} — is Ollama running?")
-    except (json.JSONDecodeError, KeyError) as e:
-        log.error(f"Ollama bad response for id={q.get('id')}: {e}")
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+    }
+
+    for attempt in range(1, OLLAMA_MAX_RETRIES + 2):
+        try:
+            resp = _http.post("/api/generate", json=payload)
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
+            return json.loads(raw)
+
+        except httpx.HTTPStatusError as e:
+            log.error(
+                f"id={q.get('id')} Ollama HTTP {e.response.status_code} "
+                f"(attempt {attempt}): {e.response.text[:200]}"
+            )
+            if e.response.status_code == 404:
+                log.error(f"  → Model '{OLLAMA_MODEL}' not found. Run: ollama pull {OLLAMA_MODEL}")
+                return {}
+
+        except httpx.RequestError as e:
+            log.error(f"id={q.get('id')} Ollama connection error (attempt {attempt}): {e}")
+
+        except (json.JSONDecodeError, KeyError) as e:
+            log.error(f"id={q.get('id')} Ollama bad JSON (attempt {attempt}): {e}")
+            break  # malformed JSON won't improve on retry
+
+        if attempt <= OLLAMA_MAX_RETRIES:
+            time.sleep(2 ** attempt)  # 2s, 4s, ...
+
     return {}

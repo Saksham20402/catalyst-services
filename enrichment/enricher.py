@@ -1,59 +1,95 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from enrichment.config import USE_SEARCH
-from enrichment.db import update_question
+from enrichment.config import MAX_WORKERS, USE_SEARCH
+from enrichment.db import bulk_update
 from enrichment.ollama_client import enrich_with_ollama
 from enrichment.search import search_context
 
 log = logging.getLogger(__name__)
 
+_VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 
-def process_question(q: dict[str, Any]) -> bool:
+
+def _enrich_one(q: dict[str, Any]) -> dict[str, Any] | None:
     """
-    Full pipeline for a single question:
-      1. Optional DuckDuckGo search for context
-      2. Ollama enrichment (explanation + difficulty check + relevance check)
-      3. Supabase update
+    Enrich a single question.
 
-    Returns True on success, False on failure.
+    Returns a dict ready for bulk_upsert (includes "id"), or None on failure.
+    The LLM always assesses difficulty independently — we always write back
+    whatever it returns (no conditional 'was it wrong?' gate).
     """
     qid = q.get("id")
-    text = q.get("text", "")
-    subject = q.get("subject", "")
-    topic = q.get("topic", "")
+    log.info(f"  id={qid}: starting ...")
 
-    # 1. Search context
     context = ""
-    if USE_SEARCH and text:
-        parts = [p for p in [subject, topic, text[:80]] if p]
-        query = " ".join(parts).strip()
-        context = search_context(query)
+    if USE_SEARCH:
+        parts = [p for p in [q.get("subject", ""), q.get("topic", ""), q.get("text", "")[:80]] if p]
+        log.info(f"  id={qid}: searching ...")
+        context = search_context(" ".join(parts))
 
-    # 2. LLM call
+    log.info(f"  id={qid}: calling Ollama ...")
     result = enrich_with_ollama(q, context)
     if not result:
-        log.warning(f"Skipping id={qid} — Ollama returned no usable result")
-        return False
+        log.warning(f"id={qid}: Ollama returned nothing — skipping")
+        return None
 
-    # 3. Build DB update — only touch fields that exist in the schema
-    updates: dict[str, Any] = {}
+    explanation = result.get("explanation", "").strip()
+    if not explanation:
+        log.warning(f"id={qid}: empty explanation — skipping")
+        return None
 
-    if result.get("explanation"):
-        updates["explanation"] = result["explanation"]
+    update: dict[str, Any] = {"id": qid, "explanation": explanation}
 
-    # Only overwrite difficulty if the model says it's wrong
-    if result.get("difficulty_correct") is False and result.get("difficulty_suggested"):
-        updates["difficulty"] = result["difficulty_suggested"]
-        log.info(f"id={qid}: difficulty corrected {q.get('difficulty')} → {result['difficulty_suggested']}")
+    difficulty = result.get("difficulty", "").strip().lower()
+    if difficulty in _VALID_DIFFICULTIES:
+        old = q.get("difficulty", "")
+        if difficulty != old:
+            log.info(f"id={qid}: difficulty {old!r} → {difficulty!r}")
+        update["difficulty"] = difficulty
+    else:
+        log.warning(f"id={qid}: unexpected difficulty value {difficulty!r} — not updating")
 
-    if not updates:
-        log.warning(f"id={qid}: nothing to update")
-        return False
+    return update
 
-    update_question(qid, updates)
-    log.debug(
-        f"id={qid} | difficulty_ok={result.get('difficulty_correct')} "
-        f"| relevant={result.get('is_relevant')} | relevance={result.get('relevance_reason', '')[:60]}"
-    )
-    return True
+
+def process_batch(questions: list[dict[str, Any]]) -> tuple[int, int]:
+    """
+    Enrich all questions in the batch in parallel, then write all results in
+    one bulk DB round-trip.
+
+    Returns (ok_count, fail_count).
+    """
+    updates: list[dict[str, Any]] = []
+    fail = 0
+    total = len(questions)
+    done = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="enrich") as executor:
+        futures = {executor.submit(_enrich_one, q): q for q in questions}
+        for future in as_completed(futures):
+            q = futures[future]
+            qid = q.get("id")
+            done += 1
+            try:
+                update = future.result()
+                if update is not None:
+                    difficulty = update.get("difficulty", "?")
+                    log.info(
+                        f"  [{done}/{total}] id={qid} ready — "
+                        f"difficulty={difficulty!r}  "
+                        f"explanation={len(update.get('explanation',''))}chars"
+                    )
+                    updates.append(update)
+                else:
+                    log.warning(f"  [{done}/{total}] id={qid} FAILED — skipped")
+                    fail += 1
+            except Exception as e:
+                log.error(f"  [{done}/{total}] id={qid} ERROR: {e}")
+                fail += 1
+
+    log.info(f"Writing {len(updates)} rows to DB ...")
+    ok = bulk_update(updates)
+    log.info(f"Write complete — {ok} written, {fail} failed")
+    return ok, fail

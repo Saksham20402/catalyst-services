@@ -9,53 +9,53 @@ log = logging.getLogger(__name__)
 
 _client: Client | None = None
 
+# Pull only what the enrichment pipeline needs — avoids fetching embeddings / large unused columns
+_SELECT_FIELDS = "id,text,subject,topic,difficulty,options,correct_index"
+
 
 def get_client() -> Client:
     global _client
     if _client is None:
-        log.info("Connecting to Supabase...")
         _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
         log.info("Supabase client ready")
     return _client
 
 
-def fetch_questions(offset: int = 0, unenriched_only: bool = False) -> list[dict[str, Any]]:
-    """Fetch a batch of questions from the database."""
-    client = get_client()
-    query = client.table(QUESTIONS_TABLE).select("*")
-    if unenriched_only:
-        query = query.is_("explanation", "null")
-    response = query.range(offset, offset + BATCH_SIZE - 1).execute()
-    rows = response.data if isinstance(response.data, list) else []
-    log.debug(f"Fetched {len(rows)} questions (offset={offset}, unenriched_only={unenriched_only})")
-    return rows
+def fetch_unenriched_batch(offset: int = 0) -> list[dict[str, Any]]:
+    """
+    Fetch one batch of questions that still need enrichment.
 
-
-def fetch_all_unenriched() -> list[dict[str, Any]]:
-    """Fetch all questions that have no explanation yet, in paginated batches."""
-    all_rows: list[dict[str, Any]] = []
-    offset = 0
-    while True:
-        batch = fetch_questions(offset, unenriched_only=True)
-        if not batch:
-            break
-        all_rows.extend(batch)
-        if len(batch) < BATCH_SIZE:
-            break
-        offset += BATCH_SIZE
-    log.info(f"Total unenriched questions: {len(all_rows)}")
-    return all_rows
-
-
-def update_question(row_id: Any, updates: dict[str, Any]) -> dict[str, Any]:
-    """Push updated fields back for a single question row."""
+    Filtering by explanation IS NULL at the DB level means:
+    - processed rows are excluded before they leave the database
+    - always calling with offset=0 is safe — each successful write shrinks the
+      result set, so there's no risk of re-processing or skipping rows
+    """
     client = get_client()
     response = (
         client.table(QUESTIONS_TABLE)
-        .update(updates)
-        .eq("id", row_id)
+        .select(_SELECT_FIELDS)
+        .is_("explanation", "null")
+        .range(offset, offset + BATCH_SIZE - 1)
         .execute()
     )
-    updated = response.data[0] if response.data else {}
-    log.debug(f"Updated question id={row_id}")
-    return updated
+    rows = response.data if isinstance(response.data, list) else []
+    log.debug(f"Fetched {len(rows)} unenriched questions (offset={offset})")
+    return rows
+
+
+def bulk_update(updates: list[dict[str, Any]]) -> int:
+    """
+    Write enrichment results for a batch.  Each item must include "id" plus
+    the fields to set.  Uses individual UPDATE calls — upsert is intentionally
+    avoided because partial rows (only explanation + difficulty) would violate
+    NOT NULL constraints on other columns during the INSERT fallback path.
+    """
+    if not updates:
+        return 0
+    client = get_client()
+    for item in updates:
+        row_id = item["id"]
+        fields = {k: v for k, v in item.items() if k != "id"}
+        client.table(QUESTIONS_TABLE).update(fields).eq("id", row_id).execute()
+    log.debug(f"Updated {len(updates)} rows")
+    return len(updates)
