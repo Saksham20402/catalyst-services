@@ -21,9 +21,18 @@ def get_client() -> Client:
     return _client
 
 
-def fetch_unenriched_batch(offset: int = 0) -> list[dict[str, Any]]:
-    """
-    Fetch one batch of questions that still need enrichment.
+def fetch_questions(offset: int = 0, unenriched_only: bool = False) -> list[dict[str, Any]]:
+    """Fetch a batch of OS questions from the database."""
+    from enrichment.config import SUBJECT_FILTER
+    client = get_client()
+    query = client.table(QUESTIONS_TABLE).select("*").eq("subject", SUBJECT_FILTER)
+    if unenriched_only:
+        query = query.is_("explanation", "null")
+    response = query.range(offset, offset + BATCH_SIZE - 1).execute()
+    rows = response.data if isinstance(response.data, list) else []
+    log.debug(f"Fetched {len(rows)} questions (offset={offset}, subject={SUBJECT_FILTER}, unenriched_only={unenriched_only})")
+    return rows
+
 
     Filtering by explanation IS NULL at the DB level means:
     - processed rows are excluded before they leave the database
@@ -38,24 +47,16 @@ def fetch_unenriched_batch(offset: int = 0) -> list[dict[str, Any]]:
         .range(offset, offset + BATCH_SIZE - 1)
         .execute()
     )
-    rows = response.data if isinstance(response.data, list) else []
-    log.debug(f"Fetched {len(rows)} unenriched questions (offset={offset})")
-    return rows
+    updated = response.data[0] if response.data else {}
+    log.debug(f"Updated question id={row_id}")
+    return updated
 
 
-def bulk_update(updates: list[dict[str, Any]]) -> int:
-    """
-    Write enrichment results for a batch.  Each item must include "id" plus
-    the fields to set.  Uses individual UPDATE calls — upsert is intentionally
-    avoided because partial rows (only explanation + difficulty) would violate
-    NOT NULL constraints on other columns during the INSERT fallback path.
-    """
-    if not updates:
-        return 0
+def update_questions_batch(updates: list[dict[str, Any]]) -> None:
+    """Update multiple question rows, one UPDATE per row (avoids upsert's not-null constraints)."""
     client = get_client()
-    for item in updates:
-        row_id = item["id"]
-        fields = {k: v for k, v in item.items() if k != "id"}
-        client.table(QUESTIONS_TABLE).update(fields).eq("id", row_id).execute()
-    log.debug(f"Updated {len(updates)} rows")
-    return len(updates)
+    for row in updates:
+        row_id = row.pop("id")
+        client.table(QUESTIONS_TABLE).update(row).eq("id", row_id).execute()
+        row["id"] = row_id  # restore so callers aren't surprised
+    log.debug(f"Batch updated {len(updates)} questions")

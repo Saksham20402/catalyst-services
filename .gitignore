@@ -1,0 +1,8 @@
+lufc/
+browser_session/
+browser_data/
+__pycache__/
+.env
+.DS_Store
+data/
+playwright_data/

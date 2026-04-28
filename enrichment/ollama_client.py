@@ -2,60 +2,43 @@ import json
 import logging
 import time
 
-import httpx
+from groq import Groq, RateLimitError
 
-from enrichment.config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT, OLLAMA_MAX_RETRIES
+from enrichment.config import GROQ_API_KEY, GROQ_MODEL
 
 log = logging.getLogger(__name__)
 
-# Shared client — reuses the TCP connection across all LLM calls (eliminates
-# per-request handshake overhead; critical when processing hundreds of questions)
-_http = httpx.Client(
-    base_url=OLLAMA_BASE_URL,
-    timeout=OLLAMA_TIMEOUT,
-    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+_client = Groq(api_key=GROQ_API_KEY)
+
+_SYSTEM_PROMPT = (
+    "You are an Operating Systems exam analyst. "
+    "Given a JSON array of multiple-choice questions, return a JSON object with a single key 'results' "
+    "containing an array — one object per question, in the same order as the input.\n\n"
+    "Each object must have exactly these keys:\n"
+    '  "id": copy the question id exactly as given,\n'
+    '  "explanation": 2-3 sentences — state clearly why the correct answer is right, '
+    "then briefly why each wrong option is incorrect (name the option explicitly),\n"
+    '  "difficulty_correct": true if the labelled difficulty accurately reflects the question, false otherwise,\n'
+    '  "difficulty_suggested": "easy", "medium", or "hard".\n\n'
+    "Return ONLY the JSON object. No markdown, no extra text."
 )
 
-# Lean prompt: no unused fields (relevance_reason, difficulty_correct removed).
-# Asking the model to independently assess difficulty — not to "validate" a label —
-# avoids anchoring bias and always gives us a fresh AI-rated difficulty to store.
-_PROMPT = """\
-You are an exam question analyst. Return ONLY valid JSON — no markdown, no extra text.
 
-Subject: {subject}
-Topic: {topic}
-Question: {text}
-Options: {options}
-Correct answer: {correct_answer}
-
-Respond with this exact JSON:
-{{
-  "explanation": "<step-by-step explanation of why the correct answer is right and each wrong option is incorrect — clear enough for a student who picked the wrong answer>",
-  "difficulty": "easy|medium|hard"
-}}
-
-Difficulty rules:
-- easy   = single concept, directly stated in the question
-- medium = requires applying or combining two concepts
-- hard   = requires multi-step reasoning, subtle distinctions, or deep domain knowledge
-"""
-
-
-def _build_prompt(q: dict, context: str = "") -> str:
+def _format_question(q: dict) -> dict:
     options = q.get("options", [])
     correct_index = q.get("correct_index")
     try:
         correct_answer = options[int(correct_index)] if correct_index is not None else "N/A"
     except (IndexError, TypeError, ValueError):
         correct_answer = str(correct_index)
-
-    prompt = _PROMPT.format(
-        subject=q.get("subject", "General"),
-        topic=q.get("topic", ""),
-        text=q.get("text", ""),
-        options=", ".join(f"{i}. {o}" for i, o in enumerate(options)) if isinstance(options, list) else str(options),
-        correct_answer=correct_answer,
-    )
+    return {
+        "id": q.get("id"),
+        "topic": q.get("topic", ""),
+        "difficulty": q.get("difficulty", "medium"),
+        "text": q.get("text", ""),
+        "options": options if isinstance(options, list) else [],
+        "correct_answer": correct_answer,
+    }
 
     if context:
         prompt = f"Background context: {context}\n\n" + prompt
@@ -63,43 +46,37 @@ def _build_prompt(q: dict, context: str = "") -> str:
     return prompt
 
 
-def enrich_with_ollama(q: dict, context: str = "") -> dict:
+def enrich_batch(questions: list[dict], _retry: int = 0) -> dict:
     """
-    Call local Ollama and return the parsed enrichment dict, or {} on failure.
-    Retries up to OLLAMA_MAX_RETRIES times with exponential back-off.
+    Send a batch of questions to Groq in a single API call.
+    Returns {str(id): result_dict} for all questions in the batch.
+    On failure returns {} so the caller can mark them all as failed.
     """
-    prompt = _build_prompt(q, context)
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-    }
+    formatted = [_format_question(q) for q in questions]
+    try:
+        response = _client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(formatted, ensure_ascii=False)},
+            ],
+            response_format={"type": "json_object"},
+            timeout=60.0,
+        )
+        raw = response.choices[0].message.content
+        parsed = json.loads(raw)
+        results = parsed.get("results", [])
+        return {str(r["id"]): r for r in results if "id" in r}
 
-    for attempt in range(1, OLLAMA_MAX_RETRIES + 2):
-        try:
-            resp = _http.post("/api/generate", json=payload)
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            return json.loads(raw)
+    except RateLimitError:
+        if _retry < 3:
+            wait = 10 * (2 ** _retry)  # 10s, 20s, 40s
+            log.warning(f"Rate limit hit — retrying in {wait}s (attempt {_retry + 1}/3)...")
+            time.sleep(wait)
+            return enrich_batch(questions, _retry + 1)
+        log.error(f"Rate limit exceeded after 3 retries for ids={[q.get('id') for q in questions]}")
+        return {}
 
-        except httpx.HTTPStatusError as e:
-            log.error(
-                f"id={q.get('id')} Ollama HTTP {e.response.status_code} "
-                f"(attempt {attempt}): {e.response.text[:200]}"
-            )
-            if e.response.status_code == 404:
-                log.error(f"  → Model '{OLLAMA_MODEL}' not found. Run: ollama pull {OLLAMA_MODEL}")
-                return {}
-
-        except httpx.RequestError as e:
-            log.error(f"id={q.get('id')} Ollama connection error (attempt {attempt}): {e}")
-
-        except (json.JSONDecodeError, KeyError) as e:
-            log.error(f"id={q.get('id')} Ollama bad JSON (attempt {attempt}): {e}")
-            break  # malformed JSON won't improve on retry
-
-        if attempt <= OLLAMA_MAX_RETRIES:
-            time.sleep(2 ** attempt)  # 2s, 4s, ...
-
-    return {}
+    except Exception as e:
+        log.error(f"Groq batch error (ids={[q.get('id') for q in questions]}): {e}")
+        return {}

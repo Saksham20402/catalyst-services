@@ -10,14 +10,27 @@ QUESTIONS_TABLE: str = os.getenv("QUESTIONS_TABLE", "questions")
 # Rows fetched from DB per paginated request
 BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "50"))
 
-# Ollama
-OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_TIMEOUT: float = float(os.getenv("OLLAMA_TIMEOUT", "90"))
-OLLAMA_MAX_RETRIES: int = int(os.getenv("OLLAMA_MAX_RETRIES", "2"))
+# Groq
+GROQ_API_KEY: str = os.environ["GROQ_API_KEY"]
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-# Parallel LLM threads — tune to your hardware
-MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "4"))
+# How many questions to pack into a single Groq API call
+LLM_BATCH_SIZE: int = int(os.getenv("LLM_BATCH_SIZE", "10"))
 
-# DuckDuckGo context search — off by default (saves ~1s/question, rarely improves output)
-USE_SEARCH: bool = os.getenv("USE_SEARCH", "false").lower() == "true"
+# Seconds to sleep between Groq calls to stay under the free-tier rate limit
+CHUNK_SLEEP: float = float(os.getenv("CHUNK_SLEEP", "22"))
+
+# Only process questions matching this subject
+SUBJECT_FILTER: str = os.getenv("SUBJECT_FILTER", "Operating Systems")
+
+# Skip questions that already have an explanation
+SKIP_ENRICHED: bool = os.getenv("SKIP_ENRICHED", "true").lower() == "true"
+
+# File used to persist batch offset across runs (relative to CWD)
+PROGRESS_FILE: str = os.getenv("PROGRESS_FILE", ".enrichment_progress.json")
+
+SUPABASE_HOST = os.getenv("DB_HOST")
+SUPABASE_PORT = os.getenv("PORT")
+SUPABASE_PASSWORD = os.getenv("PASSWORD")
+SUPABASE_USER = os.getenv("USER")
+DB_NAME = os.getenv("DB_NAME")
