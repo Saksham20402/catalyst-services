@@ -1,7 +1,7 @@
 import operator
 from dataclasses import dataclass, field
 from typing import Optional, Any, List, Annotated  # Added List and Annotated
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 @dataclass
 class QuestionDTO:
@@ -30,3 +30,5 @@ class PipelineState(TypedDict):
     # Accumulated results
     enriched: Annotated[List[dict], operator.add]
     failed: Annotated[List[dict], operator.add]
+    vectors: NotRequired[List[List[float]]]
+    dim: NotRequired[int]

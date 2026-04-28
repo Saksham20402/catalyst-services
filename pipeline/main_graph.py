@@ -3,7 +3,8 @@ from langgraph.graph import StateGraph, START, END
 from .extarct import extract_and_batch
 from .enrich import enrich_batch
 from .validate import validate_batch
-from .write import write_to_db,write_to_dlq
+from .write import write_to_db, write_to_dlq
+from .qdrant_upsert import generate_and_validate_vectors, upsert_vectors_to_qdrant
 from ingestion.models import PipelineState
 
 
@@ -37,6 +38,8 @@ def build_graph():
     workflow.add_node("enrich", enrich_batch)
     workflow.add_node("validate", validate_batch)
     workflow.add_node("write_db", write_to_db)
+    workflow.add_node("qdrant_embed", generate_and_validate_vectors)
+    workflow.add_node("qdrant_upsert", upsert_vectors_to_qdrant)
     workflow.add_node("write_dlq", write_to_dlq)
     workflow.add_node("manage_loop", manage_loop)
 
@@ -57,7 +60,9 @@ def build_graph():
         }
     )
 
-    workflow.add_edge("write_db", "manage_loop")
+    workflow.add_edge("write_db", "qdrant_embed")
+    workflow.add_edge("qdrant_embed", "qdrant_upsert")
+    workflow.add_edge("qdrant_upsert", "manage_loop")
     workflow.add_edge("write_dlq", "manage_loop")
     workflow.add_conditional_edges(
         "manage_loop",
