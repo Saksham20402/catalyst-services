@@ -63,7 +63,10 @@ def update_question(row_id: Any, updates: dict[str, Any]) -> dict[str, Any]:
 
 
 def update_questions_batch(updates: list[dict[str, Any]]) -> None:
-    """Upsert multiple question rows in a single DB call."""
+    """Update multiple question rows, one UPDATE per row (avoids upsert's not-null constraints)."""
     client = get_client()
-    client.table(QUESTIONS_TABLE).upsert(updates).execute()
-    log.debug(f"Batch upserted {len(updates)} questions")
+    for row in updates:
+        row_id = row.pop("id")
+        client.table(QUESTIONS_TABLE).update(row).eq("id", row_id).execute()
+        row["id"] = row_id  # restore so callers aren't surprised
+    log.debug(f"Batch updated {len(updates)} questions")
