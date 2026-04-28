@@ -13,7 +13,6 @@ import logging
 import os
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 logging.basicConfig(
@@ -66,40 +65,20 @@ def _clear_progress(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Batch processing
-# ---------------------------------------------------------------------------
-
-def _process_batch(questions: list, executor: ThreadPoolExecutor) -> tuple[int, int]:
-    from enrichment.enricher import process_question
-
-    futures = {executor.submit(process_question, q): q for q in questions}
-    ok = fail = 0
-    for future in as_completed(futures):
-        q = futures[future]
-        try:
-            if future.result():
-                ok += 1
-            else:
-                fail += 1
-        except Exception as e:
-            log.error(f"Unhandled error for id={q.get('id')}: {e}")
-            fail += 1
-    return ok, fail
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    from enrichment.config import BATCH_SIZE, MAX_WORKERS, SKIP_ENRICHED, PROGRESS_FILE, OLLAMA_MODEL, OLLAMA_BASE_URL
+    from enrichment.config import BATCH_SIZE, LLM_BATCH_SIZE, CHUNK_SLEEP, SKIP_ENRICHED, PROGRESS_FILE, GROQ_MODEL, SUBJECT_FILTER
     from enrichment.db import fetch_questions
+    from enrichment.enricher import process_batch
 
     log.info("=" * 60)
     log.info("Enrichment service starting")
-    log.info(f"  Ollama   : {OLLAMA_BASE_URL}  model={OLLAMA_MODEL}")
-    log.info(f"  Workers  : {MAX_WORKERS}  batch_size={BATCH_SIZE}")
-    log.info(f"  Mode     : {'skip already-enriched' if SKIP_ENRICHED else 'process all'}")
+    log.info(f"  Groq model : {GROQ_MODEL}")
+    log.info(f"  Subject    : {SUBJECT_FILTER}")
+    log.info(f"  LLM batch  : {LLM_BATCH_SIZE} questions/call")
+    log.info(f"  Mode       : {'skip already-enriched' if SKIP_ENRICHED else 'process all'}")
     log.info("=" * 60)
 
     progress = _load_progress(PROGRESS_FILE)
@@ -109,28 +88,31 @@ def main() -> None:
 
     t_start = time.monotonic()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="enrich") as executor:
-        while True:
-            batch = fetch_questions(offset, unenriched_only=SKIP_ENRICHED)
-            if not batch:
-                log.info("No more questions to process.")
-                break
+    while True:
+        db_batch = fetch_questions(offset, unenriched_only=SKIP_ENRICHED)
+        if not db_batch:
+            log.info("No more questions to process.")
+            break
 
-            log.info(f"Batch offset={offset} | processing {len(batch)} questions ...")
-            ok, fail = _process_batch(batch, executor)
+        n_chunks = -(-len(db_batch) // LLM_BATCH_SIZE)
+        log.info(f"DB batch offset={offset} | {len(db_batch)} questions → {n_chunks} Groq calls")
+
+        for i in range(0, len(db_batch), LLM_BATCH_SIZE):
+            chunk = db_batch[i:i + LLM_BATCH_SIZE]
+            ok, fail = process_batch(chunk)
             total_ok += ok
             total_fail += fail
+            log.info(f"  Chunk [{i+1}–{i+len(chunk)}]: ok={ok} fail={fail} | total ok={total_ok} fail={total_fail}")
 
-            log.info(
-                f"Batch done | ok={ok} fail={fail} | "
-                f"running total ok={total_ok} fail={total_fail}"
-            )
+            # Proactive rate-limit guard — sleep between calls so we never hit 429
+            if i + LLM_BATCH_SIZE < len(db_batch):
+                time.sleep(CHUNK_SLEEP)
 
-            offset += len(batch)
-            _save_progress(PROGRESS_FILE, offset, total_ok, total_fail)
+        offset += len(db_batch)
+        _save_progress(PROGRESS_FILE, offset, total_ok, total_fail)
 
-            if len(batch) < BATCH_SIZE:
-                break
+        if len(db_batch) < BATCH_SIZE:
+            break
 
     elapsed = time.monotonic() - t_start
     log.info("=" * 60)
@@ -142,7 +124,7 @@ def main() -> None:
     else:
         log.warning(
             f"{total_fail} question(s) failed. Progress file kept at '{PROGRESS_FILE}'. "
-            f"Re-run to retry failed questions (set SKIP_ENRICHED=true to skip already-done ones)."
+            "Re-run to retry (SKIP_ENRICHED=true will skip already-done ones)."
         )
     log.info("=" * 60)
 

@@ -1,59 +1,40 @@
 import logging
 from typing import Any
 
-from enrichment.config import USE_SEARCH
-from enrichment.db import update_question
-from enrichment.ollama_client import enrich_with_ollama
-from enrichment.search import search_context
+from enrichment.db import update_questions_batch
+from enrichment.ollama_client import enrich_batch
 
 log = logging.getLogger(__name__)
 
 
-def process_question(q: dict[str, Any]) -> bool:
+def process_batch(questions: list[dict[str, Any]]) -> tuple[int, int]:
     """
-    Full pipeline for a single question:
-      1. Optional DuckDuckGo search for context
-      2. Ollama enrichment (explanation + difficulty check + relevance check)
-      3. Supabase update
-
-    Returns True on success, False on failure.
+    Enrich a batch of questions with a single Groq API call, then write all
+    results to DB in one upsert. Returns (ok_count, fail_count).
     """
-    qid = q.get("id")
-    text = q.get("text", "")
-    subject = q.get("subject", "")
-    topic = q.get("topic", "")
+    results = enrich_batch(questions)
+    ok = fail = 0
+    db_updates: list[dict[str, Any]] = []
 
-    # 1. Search context
-    context = ""
-    if USE_SEARCH and text:
-        parts = [p for p in [subject, topic, text[:80]] if p]
-        query = " ".join(parts).strip()
-        context = search_context(query)
+    for q in questions:
+        qid = q.get("id")
+        result = results.get(str(qid), {})
 
-    # 2. LLM call
-    result = enrich_with_ollama(q, context)
-    if not result:
-        log.warning(f"Skipping id={qid} — Ollama returned no usable result")
-        return False
+        if not result or not result.get("explanation"):
+            log.warning(f"id={qid}: no usable result — will retry on next run")
+            fail += 1
+            continue
 
-    # 3. Build DB update — only touch fields that exist in the schema
-    updates: dict[str, Any] = {}
+        update: dict[str, Any] = {"id": qid, "explanation": result["explanation"]}
 
-    if result.get("explanation"):
-        updates["explanation"] = result["explanation"]
+        if result.get("difficulty_correct") is False and result.get("difficulty_suggested"):
+            update["difficulty"] = result["difficulty_suggested"]
+            log.info(f"id={qid}: difficulty corrected → {result['difficulty_suggested']}")
 
-    # Only overwrite difficulty if the model says it's wrong
-    if result.get("difficulty_correct") is False and result.get("difficulty_suggested"):
-        updates["difficulty"] = result["difficulty_suggested"]
-        log.info(f"id={qid}: difficulty corrected {q.get('difficulty')} → {result['difficulty_suggested']}")
+        db_updates.append(update)
+        ok += 1
 
-    if not updates:
-        log.warning(f"id={qid}: nothing to update")
-        return False
+    if db_updates:
+        update_questions_batch(db_updates)
 
-    update_question(qid, updates)
-    log.debug(
-        f"id={qid} | difficulty_ok={result.get('difficulty_correct')} "
-        f"| relevant={result.get('is_relevant')} | relevance={result.get('relevance_reason', '')[:60]}"
-    )
-    return True
+    return ok, fail

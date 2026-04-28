@@ -20,14 +20,15 @@ def get_client() -> Client:
 
 
 def fetch_questions(offset: int = 0, unenriched_only: bool = False) -> list[dict[str, Any]]:
-    """Fetch a batch of questions from the database."""
+    """Fetch a batch of OS questions from the database."""
+    from enrichment.config import SUBJECT_FILTER
     client = get_client()
-    query = client.table(QUESTIONS_TABLE).select("*")
+    query = client.table(QUESTIONS_TABLE).select("*").eq("subject", SUBJECT_FILTER)
     if unenriched_only:
         query = query.is_("explanation", "null")
     response = query.range(offset, offset + BATCH_SIZE - 1).execute()
     rows = response.data if isinstance(response.data, list) else []
-    log.debug(f"Fetched {len(rows)} questions (offset={offset}, unenriched_only={unenriched_only})")
+    log.debug(f"Fetched {len(rows)} questions (offset={offset}, subject={SUBJECT_FILTER}, unenriched_only={unenriched_only})")
     return rows
 
 
@@ -59,3 +60,10 @@ def update_question(row_id: Any, updates: dict[str, Any]) -> dict[str, Any]:
     updated = response.data[0] if response.data else {}
     log.debug(f"Updated question id={row_id}")
     return updated
+
+
+def update_questions_batch(updates: list[dict[str, Any]]) -> None:
+    """Upsert multiple question rows in a single DB call."""
+    client = get_client()
+    client.table(QUESTIONS_TABLE).upsert(updates).execute()
+    log.debug(f"Batch upserted {len(updates)} questions")
