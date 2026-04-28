@@ -5,10 +5,9 @@ load_dotenv()
 
 SUPABASE_URL: str = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY: str = os.environ["SUPABASE_SERVICE_KEY"]
-
 QUESTIONS_TABLE: str = os.getenv("QUESTIONS_TABLE", "questions")
 
-# How many rows to fetch from DB per paginated request
+# Rows fetched from DB per paginated request
 BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "50"))
 
 # Groq

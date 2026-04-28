@@ -1,16 +1,24 @@
 """
-Entry point for the enrichment service.
+Enrichment service — optimised entry point.
 
-Run with:
+Run:
     python -m enrichment.run
 
-Resume after interruption:
-    Re-run the same command — progress is automatically restored from
-    .enrichment_progress.json (or the path set in PROGRESS_FILE).
+Idempotency guarantee
+---------------------
+The DB query always filters by  explanation IS NULL.  Once a question is
+successfully enriched its explanation field is non-null, so it is invisible to
+every subsequent fetch — no progress file, no offset bookkeeping, no risk of
+re-processing.  Re-running the script after an interruption is safe: it picks
+up exactly where it left off at zero extra cost.
+
+Batch sizing demo
+-----------------
+Set BATCH_SIZE=10 (env or .env) to verify 10-question batches.  Each batch
+log line shows which questions are processed; re-running shows they are not
+repeated because the DB filter excludes them.
 """
-import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -81,12 +89,31 @@ def main() -> None:
     log.info(f"  Mode       : {'skip already-enriched' if SKIP_ENRICHED else 'process all'}")
     log.info("=" * 60)
 
-    progress = _load_progress(PROGRESS_FILE)
-    offset = progress["offset"]
-    total_ok = progress["total_ok"]
-    total_fail = progress["total_fail"]
-
     t_start = time.monotonic()
+    total_ok = total_fail = 0
+    batch_num = 0
+
+    while True:
+        # Always fetch from offset=0 with the unenriched filter.
+        # Rows we wrote in the previous iteration now have explanation IS NOT NULL
+        # and are excluded by the DB query — we never see them again.
+        batch = fetch_unenriched_batch(offset=0)
+        if not batch:
+            log.info("No unenriched questions remaining — all done.")
+            break
+
+        batch_num += 1
+        ids = [q.get("id") for q in batch]
+        log.info(f"--- Batch {batch_num} | {len(batch)} questions | ids: {ids} ---")
+
+        ok, fail = process_batch(batch)
+        total_ok += ok
+        total_fail += fail
+
+        log.info(
+            f"Batch {batch_num} done | ok={ok} fail={fail} | "
+            f"running total ok={total_ok} fail={total_fail}"
+        )
 
     while True:
         db_batch = fetch_questions(offset, unenriched_only=SKIP_ENRICHED)

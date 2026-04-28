@@ -9,11 +9,13 @@ log = logging.getLogger(__name__)
 
 _client: Client | None = None
 
+# Pull only what the enrichment pipeline needs — avoids fetching embeddings / large unused columns
+_SELECT_FIELDS = "id,text,subject,topic,difficulty,options,correct_index"
+
 
 def get_client() -> Client:
     global _client
     if _client is None:
-        log.info("Connecting to Supabase...")
         _client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
         log.info("Supabase client ready")
     return _client
@@ -32,29 +34,17 @@ def fetch_questions(offset: int = 0, unenriched_only: bool = False) -> list[dict
     return rows
 
 
-def fetch_all_unenriched() -> list[dict[str, Any]]:
-    """Fetch all questions that have no explanation yet, in paginated batches."""
-    all_rows: list[dict[str, Any]] = []
-    offset = 0
-    while True:
-        batch = fetch_questions(offset, unenriched_only=True)
-        if not batch:
-            break
-        all_rows.extend(batch)
-        if len(batch) < BATCH_SIZE:
-            break
-        offset += BATCH_SIZE
-    log.info(f"Total unenriched questions: {len(all_rows)}")
-    return all_rows
-
-
-def update_question(row_id: Any, updates: dict[str, Any]) -> dict[str, Any]:
-    """Push updated fields back for a single question row."""
+    Filtering by explanation IS NULL at the DB level means:
+    - processed rows are excluded before they leave the database
+    - always calling with offset=0 is safe — each successful write shrinks the
+      result set, so there's no risk of re-processing or skipping rows
+    """
     client = get_client()
     response = (
         client.table(QUESTIONS_TABLE)
-        .update(updates)
-        .eq("id", row_id)
+        .select(_SELECT_FIELDS)
+        .is_("explanation", "null")
+        .range(offset, offset + BATCH_SIZE - 1)
         .execute()
     )
     updated = response.data[0] if response.data else {}

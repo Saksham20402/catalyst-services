@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from enrichment.db import update_questions_batch
@@ -6,6 +7,7 @@ from enrichment.ollama_client import enrich_batch
 
 log = logging.getLogger(__name__)
 
+_VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 
 def process_batch(questions: list[dict[str, Any]]) -> tuple[int, int]:
     """

@@ -40,6 +40,11 @@ def _format_question(q: dict) -> dict:
         "correct_answer": correct_answer,
     }
 
+    if context:
+        prompt = f"Background context: {context}\n\n" + prompt
+
+    return prompt
+
 
 def enrich_batch(questions: list[dict], _retry: int = 0) -> dict:
     """
