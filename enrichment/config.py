@@ -11,6 +11,10 @@ QUESTIONS_TABLE: str = os.getenv("QUESTIONS_TABLE", "questions")
 # How many rows to fetch from DB per paginated request
 BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "50"))
 
+# Groq
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
 # Ollama
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2")

@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 EXPECTED_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "questions1")
-QDRANT_URL = os.getenv("VECTOR_STORE_URL")
+QDRANT_URL = os.getenv("VECTOR_DB_URL")
 QDRANT_API_KEY = os.getenv("VECTOR_DB_KEY", "").strip() or None
 
 EMBED_API_URL = os.getenv("EMBED_API_URL", "").strip().rstrip("/")

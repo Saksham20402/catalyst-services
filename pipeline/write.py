@@ -47,21 +47,23 @@ def write_to_db(state: PipelineState):
         cur = conn.cursor()
         
         query = """
-            INSERT INTO questions (id, text, options, correct_index, topic, subject, source, difficulty)
+            INSERT INTO questions (id, text, options, correct_index, topic, subject, source, difficulty, enrichment_attempts, enrichment_status)
             VALUES %s
             ON CONFLICT (id) DO NOTHING
         """
-        
+
         # Prepare data tuples
         data = [(
-            q['id'], 
-            q['text'], 
-            q['options'], 
-            q['correct_index'], 
-            q['topic'], 
-            q['subject'], 
+            q['id'],
+            q['text'],
+            q['options'],
+            q['correct_index'],
+            q['topic'],
+            q['subject'],
             q['source'],
-            q.get('difficulty') # Will be None/Null for now
+            q.get('difficulty'),
+            0,     # enrichment_attempts: the enrichment service runs post-ingestion
+            'raw', # enrichment_status: matches EnrichmentStatus.RAW default
         ) for q in current_items]
         
         execute_values(cur, query, data)

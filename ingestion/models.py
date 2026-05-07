@@ -32,3 +32,4 @@ class PipelineState(TypedDict):
     failed: Annotated[List[dict], operator.add]
     vectors: NotRequired[List[List[float]]]
     dim: NotRequired[int]
+    max_batches: NotRequired[int]  # Test mode: stop after N batches (0 or absent = process all)

@@ -1,5 +1,8 @@
+import logging
 
 from langgraph.graph import StateGraph, START, END
+
+log = logging.getLogger(__name__)
 from .extarct import extract_and_batch
 from .enrich import enrich_batch
 from .validate import validate_batch
@@ -26,8 +29,14 @@ def manage_loop(state: PipelineState):
     return {"current_batch_idx": new_idx}
 
 def should_continue(state: PipelineState):
-    # Double check if we still have batches left
-    if state["current_batch_idx"] < len(state["batches"]):
+    idx = state["current_batch_idx"]
+    total = len(state["batches"])
+    max_batches = state.get("max_batches", 0)
+
+    if max_batches and idx >= max_batches:
+        log.info("max_batches=%d reached — stopping.", max_batches)
+        return "end"
+    if idx < total:
         return "continue"
     return "end"
         
