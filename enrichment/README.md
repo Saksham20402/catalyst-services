@@ -1,153 +1,163 @@
-# Enrichment Service
+# Catalyst Enrichment Service
 
-Locally-hosted pipeline that fetches questions from Supabase, enriches them with:
-- **Explanation** — step-by-step answer breakdown via a local Ollama LLM
-- **Difficulty validation** — flags and corrects mislabelled difficulty levels
-- **Relevance check** — verifies the question fits real exam patterns for its subject
+Fetches questions from Supabase, enriches them via the Groq API, and writes
+the enrichment back. Safe to run in parallel across multiple machines with
+different Groq keys — each worker atomically claims its own batch.
 
-Uses DuckDuckGo (free, no API key) to pull web context before each LLM call for better accuracy.
+Each enriched question gains:
+
+- **explanation** — principle-first text shown after a student answers
+- **distractor_explanations** — diagnostic note when wrong options are trappy (nullable)
+- **bloom_level** — integer 1–6 (Bloom's taxonomy)
+- **difficulty** — integer 1–5
+- **is_relevant / relevance_reason** — quality flag for content review
+
+---
+
+## How parallel-safe claiming works
+
+Multiple workers can run simultaneously without re-enriching the same question.
+The mechanism is database-level, not file-based:
+
+1. `claim_batch` selects candidate row IDs (`status='raw'` OR stuck in
+   `'enriching'` for too long).
+2. It immediately runs a bulk `UPDATE ... SET status='enriching'` filtered by
+   the original status. Rows already claimed by another worker fail the
+   filter and are silently excluded.
+3. Only successfully-updated rows are returned. The current worker then
+   processes them; other workers never see them.
+
+Crashed workers are recovered automatically — `STUCK_CLAIM_MINUTES` (default 15)
+controls how long a row can sit in `'enriching'` before another worker
+reclaims it.
+
+Failed rows hit a per-row attempts cap (`MAX_ENRICHMENT_ATTEMPTS`, default 3),
+so a permanently-bad row doesn't loop forever.
+
+---
+
+## Rate-limit handling
+
+If Groq returns 429, the Groq client sleeps and retries inside the same call —
+the rest of the pipeline doesn't see the rate limit. Default schedule:
+**5s → 15s → 45s** with jitter. After 3 retries the question is marked failed.
+
+If Groq's response includes a `Retry-After` header, we honour it instead of
+the exponential schedule.
+
+5xx errors get a shorter backoff (5s → 10s → 15s); 4xx errors fail immediately.
 
 ---
 
 ## Prerequisites
 
-| Tool | Version | Install |
-|------|---------|---------|
-| Python | 3.11+ | [python.org](https://python.org) |
-| Ollama | latest | [ollama.com](https://ollama.com) |
-| Supabase project | — | Already set up |
+| Tool | Version |
+|------|---------|
+| Python | 3.11+ |
+| Supabase project | configured with `questions` table |
+| Groq API key | from [console.groq.com](https://console.groq.com) |
 
 ---
 
 ## Setup
 
-### 1. Create and activate a virtual environment
-
 ```bash
 python -m venv .venv
-source .venv/bin/activate      # macOS / Linux
-.venv\Scripts\activate         # Windows
-```
-
-### 2. Install dependencies
-
-```bash
+source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 3. Configure environment variables
-
-Copy the template and fill in your values:
-
-```bash
 cp .env.example .env
+# edit .env with your keys
 ```
 
-The minimum required variables are:
+Required env vars:
 
 ```env
 SUPABASE_URL=https://<your-project>.supabase.co
-SUPABASE_SERVICE_KEY=<your-service-role-key>
+SUPABASE_SERVICE_KEY=<service-role-key>
+GROQ_API_KEY=<your-groq-key>
 ```
-
-All configuration options are described in the [Configuration](#configuration) section below.
-
-### 4. Pull an Ollama model
-
-```bash
-ollama pull llama3.2
-```
-
-Any model available on [ollama.com/library](https://ollama.com/library) works.  
-Larger models (e.g. `llama3.1:70b`) give better explanations but are slower.
-
-### 5. Start Ollama
-
-```bash
-ollama serve
-```
-
-Leave this running in a separate terminal window.
 
 ---
 
 ## Running
 
-```bash
-python -m enrichment.run
-```
-
-The service will:
-1. Connect to Supabase and fetch unenriched questions in batches
-2. Run DuckDuckGo context search for each question (optional)
-3. Call the local Ollama model to generate enrichment
-4. Write the explanation and corrected difficulty back to Supabase
-5. Save progress after every batch to `.enrichment_progress.json`
-
----
-
-## Resuming after interruption
-
-If the script is stopped (Ctrl+C, power cut, crash), just re-run it:
+Single worker:
 
 ```bash
 python -m enrichment.run
 ```
 
-It will detect `.enrichment_progress.json` and resume from the last completed batch.  
-Progress is automatically cleared when a run finishes cleanly.
+Multiple parallel workers (different machines or terminals — give each its
+own Groq key and a unique `WORKER_ID`):
 
-> **Note:** When `SKIP_ENRICHED=true` (the default), the `explanation IS NULL` DB filter
-> acts as a second safety net — already-processed questions are never re-sent to the LLM
-> even if the offset drifts.
+```bash
+# Machine A
+WORKER_ID=worker-A GROQ_API_KEY=gsk_xxx python -m enrichment.run
+
+# Machine B (different key)
+WORKER_ID=worker-B GROQ_API_KEY=gsk_yyy python -m enrichment.run
+```
+
+Both workers run until the queue drains. Stopping one is safe — its
+in-flight rows will be reclaimed by another worker after
+`STUCK_CLAIM_MINUTES`.
 
 ---
 
 ## Configuration
 
-All options are set via environment variables (or in `.env`).
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SUPABASE_URL` | **required** | Your Supabase project URL |
-| `SUPABASE_SERVICE_KEY` | **required** | Supabase service-role key (bypasses RLS) |
-| `QUESTIONS_TABLE` | `questions` | Table name to read/write |
-| `BATCH_SIZE` | `50` | Rows fetched per DB request |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API endpoint |
-| `OLLAMA_MODEL` | `llama3.2` | Model to use for enrichment |
-| `MAX_WORKERS` | `4` | Parallel LLM threads. Set to `2` for CPU-only, `8+` for GPU |
-| `USE_SEARCH` | `true` | Enable DuckDuckGo context search before LLM calls |
-| `SKIP_ENRICHED` | `true` | Skip questions that already have an explanation |
-| `PROGRESS_FILE` | `.enrichment_progress.json` | Path to the progress checkpoint file |
+| `SUPABASE_URL` | **required** | Project URL |
+| `SUPABASE_SERVICE_KEY` | **required** | Service-role key (bypasses RLS) |
+| `GROQ_API_KEY` | **required** | Groq API key |
+| `GROQ_MODEL` | `llama-3.1-8b-instant` | Any Groq-supported model |
+| `QUESTIONS_TABLE` | `questions` | Table to read/write |
+| `BATCH_SIZE` | `50` | Rows claimed per batch |
+| `MAX_WORKERS` | `8` | Parallel Groq threads per worker process |
+| `WORKER_ID` | `<host>-<pid>` | Identifier written to `enrichment_error` on claim |
+| `STUCK_CLAIM_MINUTES` | `15` | Reclaim window for crashed workers |
+| `MAX_ENRICHMENT_ATTEMPTS` | `3` | Hard cap on retries per row |
+| `RATE_LIMIT_MAX_RETRIES` | `3` | Per-call retry attempts on 429 |
+| `RATE_LIMIT_BACKOFF_BASE_SECONDS` | `5` | First backoff sleep (then ×3 each attempt) |
 
-### Tuning for your hardware
+---
 
-| Setup | Recommended `MAX_WORKERS` |
-|-------|--------------------------|
-| CPU only (e.g. MacBook) | `2` – `4` |
-| Single consumer GPU | `4` – `6` |
-| Multiple GPUs / high-end workstation | `8` – `16` |
+## Database requirement
 
-Ollama queues requests internally, so setting workers higher than your hardware can handle will
-just add latency per request without improving throughput.
+The `questions` table must have an `updated_at` column that auto-updates on
+write (standard Supabase pattern). The stuck-claim recovery uses this column
+to detect crashed workers. If it doesn't exist yet, add it:
+
+```sql
+ALTER TABLE questions
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+  RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER questions_updated_at
+  BEFORE UPDATE ON questions
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+```
 
 ---
 
 ## Troubleshooting
 
-**`Ollama HTTP 404` / `model not found`**  
-Run `ollama pull <model>` with the model name set in `OLLAMA_MODEL`.
+**`Rate limited on id=…`** — Normal under load. The Groq client sleeps and
+retries. If you see it constantly, reduce `MAX_WORKERS`.
 
-**`Ollama connection error`**  
-Make sure Ollama is running: `ollama serve`
+**`Reclaiming N stuck rows from crashed workers`** — A previous run died
+mid-batch. The current worker is picking those up. Normal.
 
-**`No questions returned`**  
-Check `QUESTIONS_TABLE` is correct and `SUPABASE_SERVICE_KEY` has access.
+**Two workers, very low throughput** — Check that both have valid Groq keys
+and aren't hitting 429 constantly. Reduce `MAX_WORKERS` per worker if so.
 
-**Questions not getting updated in Supabase**  
-Ensure your service key has `UPDATE` permissions on the questions table (service-role key bypasses RLS by default).
-
-**Script is slow**  
-- Increase `MAX_WORKERS` if your machine has headroom
-- Set `USE_SEARCH=false` to skip DuckDuckGo lookups (saves ~1s per question)
-- Use a smaller/quantized Ollama model (e.g. `llama3.2:1b` instead of `llama3.2`)
+**Questions not updating in Supabase** — Confirm the service-role key has
+`UPDATE` permission on the questions table.

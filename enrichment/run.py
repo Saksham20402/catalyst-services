@@ -1,20 +1,18 @@
 """
-Entry point for the enrichment service.
+Entry point for the Catalyst enrichment service.
 
-Run with:
+Safe to run in parallel across multiple machines with different Groq keys.
+Each worker atomically claims its own batch via Supabase — no overlap.
+
+Usage:
     python -m enrichment.run
 
-Resume after interruption:
-    Re-run the same command — progress is automatically restored from
-    .enrichment_progress.json (or the path set in PROGRESS_FILE).
+Each run loops until claim_batch returns no rows.
 """
-import json
 import logging
-import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,51 +21,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Progress persistence
-# ---------------------------------------------------------------------------
-
-def _load_progress(path: str) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path) as f:
-                state = json.load(f)
-            log.info(
-                f"Resuming from saved progress: offset={state.get('offset', 0)} "
-                f"ok={state.get('total_ok', 0)} fail={state.get('total_fail', 0)} "
-                f"(saved at {state.get('saved_at', 'unknown')})"
-            )
-            return state
-        except (json.JSONDecodeError, OSError) as e:
-            log.warning(f"Could not read progress file ({e}), starting from scratch")
-    return {"offset": 0, "total_ok": 0, "total_fail": 0}
-
-
-def _save_progress(path: str, offset: int, total_ok: int, total_fail: int) -> None:
-    state = {
-        "offset": offset,
-        "total_ok": total_ok,
-        "total_fail": total_fail,
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        with open(path, "w") as f:
-            json.dump(state, f, indent=2)
-    except OSError as e:
-        log.warning(f"Could not save progress: {e}")
-
-
-def _clear_progress(path: str) -> None:
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Batch processing
-# ---------------------------------------------------------------------------
 
 def _process_batch(questions: list, executor: ThreadPoolExecutor) -> tuple[int, int]:
     from enrichment.enricher import process_question
@@ -82,68 +35,66 @@ def _process_batch(questions: list, executor: ThreadPoolExecutor) -> tuple[int, 
             else:
                 fail += 1
         except Exception as e:
-            log.error(f"Unhandled error for id={q.get('id')}: {e}")
+            log.error("Unhandled error for id=%s: %s", q.get("id"), e)
             fail += 1
     return ok, fail
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    from enrichment.config import BATCH_SIZE, MAX_WORKERS, SKIP_ENRICHED, PROGRESS_FILE, OLLAMA_MODEL, OLLAMA_BASE_URL
-    from enrichment.db import fetch_questions
+    from enrichment.config import (
+        BATCH_SIZE,
+        MAX_WORKERS,
+        GROQ_MODEL,
+        WORKER_ID,
+        STUCK_CLAIM_MINUTES,
+        MAX_ENRICHMENT_ATTEMPTS,
+    )
+    from enrichment.db import claim_batch, count_remaining
 
     log.info("=" * 60)
-    log.info("Enrichment service starting")
-    log.info(f"  Ollama   : {OLLAMA_BASE_URL}  model={OLLAMA_MODEL}")
-    log.info(f"  Workers  : {MAX_WORKERS}  batch_size={BATCH_SIZE}")
-    log.info(f"  Mode     : {'skip already-enriched' if SKIP_ENRICHED else 'process all'}")
+    log.info("Catalyst enrichment service starting")
+    log.info("  Worker ID         : %s", WORKER_ID)
+    log.info("  Groq model        : %s", GROQ_MODEL)
+    log.info("  Threads x batch   : %d x %d", MAX_WORKERS, BATCH_SIZE)
+    log.info("  Reclaim after     : %d min stuck in 'enriching'", STUCK_CLAIM_MINUTES)
+    log.info("  Max attempts/row  : %d", MAX_ENRICHMENT_ATTEMPTS)
     log.info("=" * 60)
 
-    progress = _load_progress(PROGRESS_FILE)
-    offset = progress["offset"]
-    total_ok = progress["total_ok"]
-    total_fail = progress["total_fail"]
+    try:
+        remaining = count_remaining()
+        log.info("Rows currently eligible: %d", remaining)
+    except Exception as e:
+        log.warning("Could not count remaining rows: %s", e)
 
+    total_ok = total_fail = total_batches = 0
     t_start = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="enrich") as executor:
         while True:
-            batch = fetch_questions(offset, unenriched_only=SKIP_ENRICHED)
+            batch = claim_batch()
             if not batch:
-                log.info("No more questions to process.")
+                log.info("No more questions to process — queue drained.")
                 break
 
-            log.info(f"Batch offset={offset} | processing {len(batch)} questions ...")
+            total_batches += 1
+            log.info("Batch #%d | claimed %d row(s) | processing...",
+                     total_batches, len(batch))
+
             ok, fail = _process_batch(batch, executor)
             total_ok += ok
             total_fail += fail
 
             log.info(
-                f"Batch done | ok={ok} fail={fail} | "
-                f"running total ok={total_ok} fail={total_fail}"
+                "Batch #%d done | ok=%d fail=%d | running total ok=%d fail=%d",
+                total_batches, ok, fail, total_ok, total_fail,
             )
-
-            offset += len(batch)
-            _save_progress(PROGRESS_FILE, offset, total_ok, total_fail)
-
-            if len(batch) < BATCH_SIZE:
-                break
 
     elapsed = time.monotonic() - t_start
     log.info("=" * 60)
-    log.info(f"Finished in {elapsed:.1f}s | total ok={total_ok} fail={total_fail}")
-
-    if total_fail == 0:
-        _clear_progress(PROGRESS_FILE)
-        log.info("Progress file cleared — clean run.")
-    else:
-        log.warning(
-            f"{total_fail} question(s) failed. Progress file kept at '{PROGRESS_FILE}'. "
-            f"Re-run to retry failed questions (set SKIP_ENRICHED=true to skip already-done ones)."
-        )
+    log.info(
+        "Finished in %.1fs | %d batch(es) | ok=%d fail=%d",
+        elapsed, total_batches, total_ok, total_fail,
+    )
     log.info("=" * 60)
 
 
