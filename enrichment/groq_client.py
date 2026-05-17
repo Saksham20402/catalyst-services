@@ -1,9 +1,8 @@
 """
-Groq client for question enrichment.
+Groq fallback client for question enrichment.
 
-Single responsibility: take a question dict, return a parsed enrichment dict,
-or {} on any failure. Rate limits are handled internally with exponential
-backoff — the caller never sees a 429.
+Used when OpenAI is rate-limited. Same interface as openai_client.enrich().
+Rate limits are handled internally with exponential backoff.
 """
 import json
 import logging
@@ -127,8 +126,7 @@ def enrich(question: dict) -> dict:
         log.error("Groq returned invalid JSON for id=%s: %s — raw: %.200s",
                   qid, e, raw)
     except RateLimitError:
-        log.error("Groq rate limit exhausted for id=%s after %d retries",
-                  qid, RATE_LIMIT_MAX_RETRIES)
+        log.error("Groq rate limit exhausted for id=%s after %d retries", qid, RATE_LIMIT_MAX_RETRIES)
     except Exception as e:
         log.error("Groq error for id=%s: %s", qid, e)
 

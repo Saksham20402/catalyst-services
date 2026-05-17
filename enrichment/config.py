@@ -14,9 +14,14 @@ SUPABASE_URL: str = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY: str = os.environ["SUPABASE_SERVICE_KEY"]
 QUESTIONS_TABLE: str = os.getenv("QUESTIONS_TABLE", "questions")
 
-# ── Groq ────────────────────────────────────────────────────────────────────
-GROQ_API_KEY: str = os.environ["GROQ_API_KEY"]
+# ── Groq (fallback when OpenAI is throttled) ────────────────────────────────
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
+# ── OpenAI (fallback when Groq is throttled) ────────────────────────────────
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+# gpt-4o-mini: cheap, fast, accurate — good fallback for enrichment
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 # ── Rate-limit handling ─────────────────────────────────────────────────────
 # Max retry attempts when Groq returns 429. Each attempt sleeps longer:
