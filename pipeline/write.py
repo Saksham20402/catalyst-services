@@ -2,20 +2,10 @@ import psycopg2
 from psycopg2.extras import execute_values
 import logging
 from ingestion.models import PipelineState
-from enrichment import config
 from .checkpoint import save_checkpoint
 
 
 log = logging.getLogger(__name__)
-
-# Connection details for your Supabase Instance
-DB_CONFIG = {
-    "dbname": config.DB_NAME,
-    "user": config.SUPABASE_USER,
-    "password": config.SUPABASE_PASSWORD,
-    "host": config.SUPABASE_HOST,
-    "port": config.SUPABASE_PORT
-}
 
 def write_to_db(state: PipelineState):
     """
@@ -52,6 +42,22 @@ def write_to_db(state: PipelineState):
             ON CONFLICT (id) DO NOTHING
         """
 
+        _DIFFICULTY_STR_TO_INT = {"easy": 1, "medium": 2, "hard": 3}
+
+        def _difficulty_int(q: dict) -> int | None:
+            """
+            Prefer difficulty_score (int 1-5 from enrichment module).
+            Fall back to mapping the legacy string field to a smallint.
+            Returns None if neither is present.
+            """
+            score = q.get("difficulty_score")
+            if isinstance(score, int):
+                return score
+            d = q.get("difficulty")
+            if isinstance(d, str):
+                return _DIFFICULTY_STR_TO_INT.get(d.strip().lower())
+            return None
+
         # Prepare data tuples
         data = [(
             q['id'],
@@ -61,7 +67,7 @@ def write_to_db(state: PipelineState):
             q['topic'],
             q['subject'],
             q['source'],
-            q.get('difficulty'),
+            _difficulty_int(q),
             0,     # enrichment_attempts: the enrichment service runs post-ingestion
             'raw', # enrichment_status: matches EnrichmentStatus.RAW default
         ) for q in current_items]
