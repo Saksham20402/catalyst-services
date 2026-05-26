@@ -13,6 +13,10 @@ class QuestionDTO:
     subject: str
     source: str
     difficulty: Optional[str] = None
+    has_code_snippet: bool = False
+    code_snippet: Optional[str] = None
+    snippet_language: Optional[str] = None
+    answer_verified: Optional[bool] = None
 
 class PipelineState(TypedDict):
     # Inputs

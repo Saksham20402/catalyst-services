@@ -15,9 +15,39 @@ MIN_REQUEST_DELAY = 12.0  # Slow and steady to avoid re-triggering CF
 MAX_REQUEST_DELAY = 18.0
 
 # --- REGEX PATTERNS ---
-QNUM_RE   = re.compile(r"(\d+)\.\s*(.+)", re.IGNORECASE)
-OPTION_RE = re.compile(r"([a-e])\)\s*(.+)", re.IGNORECASE)
-ANSWER_RE = re.compile(r"Answer\s*[:\-]?\s*([a-e])", re.IGNORECASE)
+QNUM_RE        = re.compile(r"(\d+)\.\s*(.+)", re.IGNORECASE)
+OPTION_RE      = re.compile(r"([a-e])\)\s*(.+)", re.IGNORECASE)
+ANSWER_RE      = re.compile(r"Answer\s*[:\-]?\s*([a-e])", re.IGNORECASE)
+GESHI_START_RE = re.compile(r"^\[CODESNIPPET:(.+?)\]$")
+GESHI_END      = "[/CODESNIPPET]"
+
+# GeSHi wrapper classes — outermost div to find, inner divs to skip when detecting language
+_GESHI_OUTER     = "hk1_style-wrap4"
+_GESHI_WRAPPERS  = {"hk1_style-wrap4", "hk1_style-wrap3", "hk1_style-wrap2", "hk1_style-wrap", "hk1_style"}
+
+def _preprocess_geshi(content) -> None:
+    """
+    Find every GeSHi syntax-highlighted block and replace it with a plain-text
+    marker so the line parser can reconstruct code snippets cleanly.
+
+    GeSHi structure on Sanfoundry:
+      div.hk1_style-wrap4 > ... > div.[language] > ol > li.li1 > pre.de1
+    Each <li> is one line of code; <span> children are just syntax tokens.
+    """
+    for geshi in content.find_all("div", class_=_GESHI_OUTER):
+        # The language is the class of the first inner div that isn't a wrapper
+        lang = "text"
+        for div in geshi.find_all("div"):
+            classes = div.get("class", [])
+            non_wrapper = [c for c in classes if c not in _GESHI_WRAPPERS]
+            if non_wrapper:
+                lang = non_wrapper[0]
+                break
+
+        lines = [li.get_text() for li in geshi.find_all("li")]
+        code_text = "\n".join(lines)
+        geshi.replace_with(f"[CODESNIPPET:{lang}]\n{code_text}\n{GESHI_END}")
+
 
 def slug_to_topic(url: str) -> str:
     slug = url.rstrip("/").split("/")[-1]
@@ -36,7 +66,10 @@ def finalize_q(q_dict, topic, url) -> QuestionDTO:
         correct_index=min(correct_idx, len(q_dict['options']) - 1),
         topic=topic,
         subject="Operating Systems",
-        source=url
+        source=url,
+        has_code_snippet=q_dict.get('has_code_snippet', False),
+        code_snippet=q_dict.get('code_snippet'),
+        snippet_language=q_dict.get('snippet_language'),
     )
 
 def parse_chapter(html: str, url: str) -> list[QuestionDTO]:
@@ -48,18 +81,54 @@ def parse_chapter(html: str, url: str) -> list[QuestionDTO]:
     # Clean UI artifacts
     for span in content.find_all("span", class_=re.compile(r"collapseomatic|sf-spawn")):
         span.decompose()
-    
+
+    # Replace GeSHi code blocks with plain-text markers before stripping HTML
+    _preprocess_geshi(content)
+
     all_text = content.get_text(separator="\n", strip=True).splitlines()
     questions, current_q = [], None
+    in_code, code_lang, code_lines = False, None, []
 
     for line in all_text:
         line = line.strip()
         if not line: continue
+
+        # --- Code block start ---
+        geshi_m = GESHI_START_RE.match(line)
+        if geshi_m:
+            in_code = True
+            code_lang = geshi_m.group(1)
+            code_lines = []
+            continue
+
+        # --- Code block end ---
+        if line == GESHI_END:
+            if current_q is not None:
+                current_q['code_snippet'] = "\n".join(code_lines)
+                current_q['snippet_language'] = code_lang
+                current_q['has_code_snippet'] = True
+            in_code = False
+            code_lang = None
+            code_lines = []
+            continue
+
+        if in_code:
+            code_lines.append(line)
+            continue
+
+        # --- Normal question parsing ---
         q_m = QNUM_RE.search(line)
         if q_m:
             if current_q and len(current_q['options']) >= 2 and current_q['correct_letter']:
                 questions.append(finalize_q(current_q, topic, url))
-            current_q = {"text": q_m.group(2).strip(), "options": [], "correct_letter": None}
+            current_q = {
+                "text": q_m.group(2).strip(),
+                "options": [],
+                "correct_letter": None,
+                "has_code_snippet": False,
+                "code_snippet": None,
+                "snippet_language": None,
+            }
             continue
         if not current_q: continue
         opt_m = OPTION_RE.search(line)

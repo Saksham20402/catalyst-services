@@ -2,10 +2,58 @@ import logging
 
 from ingestion.models import PipelineState
 from .groq_client import enrich_questions
+from .openai_client import enrich_code_questions
 
 log = logging.getLogger(__name__)
 
 _VALID_DIFFICULTIES = {"easy", "medium", "hard"}
+
+
+def _apply_groq_result(q: dict, result: dict) -> dict | None:
+    """Merge a Groq enrichment result onto a question dict. Returns None if unusable."""
+    if not result or not result.get("explanation"):
+        return None
+    enriched = {**q, "explanation": result["explanation"]}
+    if (
+        result.get("difficulty_correct") is False
+        and result.get("difficulty_suggested") in _VALID_DIFFICULTIES
+    ):
+        enriched["difficulty"] = result["difficulty_suggested"]
+    elif not enriched.get("difficulty"):
+        enriched["difficulty"] = result.get("difficulty_suggested", "medium")
+    return enriched
+
+
+def _apply_openai_result(q: dict, result: dict) -> dict | None:
+    """
+    Merge an OpenAI code-enrichment result onto a question dict.
+    Applies answer correction and cleaned code snippet. Returns None if unusable.
+    """
+    if not result or not result.get("explanation"):
+        return None
+
+    enriched = {**q, "explanation": result["explanation"]}
+
+    # Update cleaned code snippet if provided
+    if result.get("code_snippet_clean"):
+        enriched["code_snippet"] = result["code_snippet_clean"]
+
+    # Apply answer correction
+    enriched["answer_verified"] = result.get("answer_verified", True)
+    if result.get("answer_verified") is False:
+        corrected = result.get("corrected_correct_index")
+        if corrected is not None and 0 <= int(corrected) < len(q.get("options", [])):
+            log.info(
+                "id=%s: answer corrected by OpenAI %d → %d",
+                q.get("id"), q.get("correct_index"), corrected,
+            )
+            enriched["correct_index"] = int(corrected)
+
+    enriched["difficulty"] = result.get("difficulty_suggested", "medium")
+    # Mark as fully enriched so the standalone enrichment service skips it
+    enriched["enrichment_status"] = "enriched"
+
+    return enriched
 
 
 def enrich_batch(state: PipelineState) -> dict:
@@ -15,32 +63,39 @@ def enrich_batch(state: PipelineState) -> dict:
 
     log.info("Enriching batch %d (%d questions, attempt %d)", idx, len(batch), retry_count + 1)
 
-    results = enrich_questions(batch)
+    # Split into code-snippet questions (OpenAI) and regular questions (Groq)
+    code_qs = [q for q in batch if q.get("has_code_snippet")]
+    regular_qs = [q for q in batch if not q.get("has_code_snippet")]
 
-    enriched = []
-    failed = []
+    log.info("Batch %d: %d code questions (OpenAI), %d regular questions (Groq)", idx, len(code_qs), len(regular_qs))
 
-    for q in batch:
-        qid = str(q.get("id"))
-        result = results.get(qid, {})
+    enriched, failed = [], []
 
-        if not result or not result.get("explanation"):
-            log.warning("id=%s: no usable result from Groq", qid)
-            failed.append(q)
-            continue
+    # --- OpenAI: inline enrichment for code questions ---
+    if code_qs:
+        code_results = enrich_code_questions(code_qs)
+        for q in code_qs:
+            qid = str(q.get("id"))
+            result = code_results.get(qid, {})
+            enriched_q = _apply_openai_result(q, result)
+            if enriched_q:
+                enriched.append(enriched_q)
+            else:
+                log.warning("id=%s: OpenAI returned no usable result", qid)
+                failed.append(q)
 
-        enriched_q = {**q, "explanation": result["explanation"]}
-
-        if (
-            result.get("difficulty_correct") is False
-            and result.get("difficulty_suggested") in _VALID_DIFFICULTIES
-        ):
-            log.info("id=%s: difficulty corrected → %s", qid, result["difficulty_suggested"])
-            enriched_q["difficulty"] = result["difficulty_suggested"]
-        elif not enriched_q.get("difficulty"):
-            enriched_q["difficulty"] = result.get("difficulty_suggested", "medium")
-
-        enriched.append(enriched_q)
+    # --- Groq: standard enrichment for regular questions ---
+    if regular_qs:
+        groq_results = enrich_questions(regular_qs)
+        for q in regular_qs:
+            qid = str(q.get("id"))
+            result = groq_results.get(qid, {})
+            enriched_q = _apply_groq_result(q, result)
+            if enriched_q:
+                enriched.append(enriched_q)
+            else:
+                log.warning("id=%s: Groq returned no usable result", qid)
+                failed.append(q)
 
     log.info("Batch %d: %d enriched, %d failed", idx, len(enriched), len(failed))
 
@@ -53,9 +108,6 @@ def enrich_batch(state: PipelineState) -> dict:
     }
 
     if is_valid:
-        # Only replace batches[idx] when enrichment actually produced results.
-        # If we overwrite with [] on failure the retry loop sends an empty list
-        # to Groq, making recovery impossible.
         new_batches = list(state["batches"])
         new_batches[idx] = enriched
         update["batches"] = new_batches
