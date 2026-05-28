@@ -17,6 +17,8 @@ class QuestionDTO:
     code_snippet: Optional[str] = None
     snippet_language: Optional[str] = None
     answer_verified: Optional[bool] = None
+    source_explanation: Optional[str] = None
+    explanation_output: Optional[str] = None
 
 class PipelineState(TypedDict):
     # Inputs

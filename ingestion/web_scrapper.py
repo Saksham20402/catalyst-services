@@ -15,11 +15,14 @@ MIN_REQUEST_DELAY = 12.0  # Slow and steady to avoid re-triggering CF
 MAX_REQUEST_DELAY = 18.0
 
 # --- REGEX PATTERNS ---
-QNUM_RE        = re.compile(r"(\d+)\.\s*(.+)", re.IGNORECASE)
-OPTION_RE      = re.compile(r"([a-e])\)\s*(.+)", re.IGNORECASE)
-ANSWER_RE      = re.compile(r"Answer\s*[:\-]?\s*([a-e])", re.IGNORECASE)
-GESHI_START_RE = re.compile(r"^\[CODESNIPPET:(.+?)\]$")
-GESHI_END      = "[/CODESNIPPET]"
+QNUM_RE         = re.compile(r"^(\d+)\.\s*(.+)", re.IGNORECASE)
+OPTION_RE       = re.compile(r"^([a-e])\)\s*(.+)", re.IGNORECASE)
+ANSWER_RE       = re.compile(r"Answer\s*[:\-]?\s*([a-e])", re.IGNORECASE)
+EXPLANATION_RE  = re.compile(r"^Explanation\s*[:\-]?\s*(.*)", re.IGNORECASE)
+GESHI_START_RE  = re.compile(r"^\[CODESNIPPET:(.+?)\]$")
+GESHI_END       = "[/CODESNIPPET]"
+TERMOUT_START   = "[TERMOUTPUT]"
+TERMOUT_END     = "[/TERMOUTPUT]"
 
 # GeSHi wrapper classes — outermost div to find, inner divs to skip when detecting language
 _GESHI_OUTER     = "hk1_style-wrap4"
@@ -44,9 +47,23 @@ def _preprocess_geshi(content) -> None:
                 lang = non_wrapper[0]
                 break
 
-        lines = [li.get_text() for li in geshi.find_all("li")]
+        li_tags = geshi.find_all("li")
+        if li_tags:
+            # Line-numbered mode: ol > li.li1 > pre.de1 (one line per <li>)
+            lines = [li.get_text() for li in li_tags]
+        else:
+            # No-line-numbers mode: code is in a <pre> directly inside the language div
+            pre = geshi.find("pre")
+            lines = pre.get_text().splitlines() if pre else []
+
         code_text = "\n".join(lines)
-        geshi.replace_with(f"[CODESNIPPET:{lang}]\n{code_text}\n{GESHI_END}")
+
+        first_line = next((l.strip() for l in lines if l.strip()), "")
+        if first_line.startswith("$"):
+            # Terminal output block — preserve as a marker for the explanation parser
+            geshi.replace_with(f"{TERMOUT_START}\n{code_text}\n{TERMOUT_END}")
+        else:
+            geshi.replace_with(f"[CODESNIPPET:{lang}]\n{code_text}\n{GESHI_END}")
 
 
 def slug_to_topic(url: str) -> str:
@@ -70,6 +87,8 @@ def finalize_q(q_dict, topic, url) -> QuestionDTO:
         has_code_snippet=q_dict.get('has_code_snippet', False),
         code_snippet=q_dict.get('code_snippet'),
         snippet_language=q_dict.get('snippet_language'),
+        source_explanation=q_dict.get('source_explanation'),
+        explanation_output=q_dict.get('explanation_output'),
     )
 
 def parse_chapter(html: str, url: str) -> list[QuestionDTO]:
@@ -87,23 +106,36 @@ def parse_chapter(html: str, url: str) -> list[QuestionDTO]:
 
     all_text = content.get_text(separator="\n", strip=True).splitlines()
     questions, current_q = [], None
-    in_code, code_lang, code_lines = False, None, []
+
+    # Parser state
+    in_code        = False
+    in_term_output = False
+    in_explanation = False
+    code_lang, code_lines       = None, []
+    term_output_lines           = []
+    explanation_lines           = []
+
+    def _flush(q):
+        """Attach accumulated explanation/output to question dict before finalizing."""
+        if explanation_lines:
+            q['source_explanation'] = " ".join(explanation_lines)
+        if term_output_lines:
+            q['explanation_output'] = "\n".join(term_output_lines)
 
     for line in all_text:
         line = line.strip()
-        if not line: continue
+        if not line:
+            continue
 
-        # --- Code block start ---
+        # ── Code block (source) ──────────────────────────────────────────────
         geshi_m = GESHI_START_RE.match(line)
         if geshi_m:
             in_code = True
             code_lang = geshi_m.group(1)
             code_lines = []
             continue
-
-        # --- Code block end ---
         if line == GESHI_END:
-            if current_q is not None:
+            if current_q is not None and not in_explanation:
                 current_q['code_snippet'] = "\n".join(code_lines)
                 current_q['snippet_language'] = code_lang
                 current_q['has_code_snippet'] = True
@@ -111,15 +143,27 @@ def parse_chapter(html: str, url: str) -> list[QuestionDTO]:
             code_lang = None
             code_lines = []
             continue
-
         if in_code:
             code_lines.append(line)
             continue
 
-        # --- Normal question parsing ---
-        q_m = QNUM_RE.search(line)
+        # ── Terminal output block (explanation appendix) ─────────────────────
+        if line == TERMOUT_START:
+            in_term_output = True
+            term_output_lines = []
+            continue
+        if line == TERMOUT_END:
+            in_term_output = False
+            continue
+        if in_term_output:
+            term_output_lines.append(line)
+            continue
+
+        # ── New question number — the ONLY thing that exits explanation mode ──
+        q_m = QNUM_RE.match(line)
         if q_m:
             if current_q and len(current_q['options']) >= 2 and current_q['correct_letter']:
+                _flush(current_q)
                 questions.append(finalize_q(current_q, topic, url))
             current_q = {
                 "text": q_m.group(2).strip(),
@@ -128,19 +172,44 @@ def parse_chapter(html: str, url: str) -> list[QuestionDTO]:
                 "has_code_snippet": False,
                 "code_snippet": None,
                 "snippet_language": None,
+                "source_explanation": None,
+                "explanation_output": None,
             }
+            in_explanation = False
+            explanation_lines = []
+            term_output_lines = []
             continue
-        if not current_q: continue
-        opt_m = OPTION_RE.search(line)
+
+        if not current_q:
+            continue
+
+        # ── Explanation mode — collect text, ignore option/answer patterns ───
+        if in_explanation:
+            exp_m = EXPLANATION_RE.match(line)
+            if exp_m:
+                rest = exp_m.group(1).strip()
+                if rest:
+                    explanation_lines.append(rest)
+            else:
+                explanation_lines.append(line)
+            continue
+
+        # ── Normal question parsing ───────────────────────────────────────────
+        opt_m = OPTION_RE.match(line)
         if opt_m:
             current_q['options'].append(opt_m.group(2).strip())
             continue
         ans_m = ANSWER_RE.search(line)
         if ans_m:
             current_q['correct_letter'] = ans_m.group(1)
+            in_explanation = True   # everything after this belongs to explanation
+            explanation_lines = []
+            term_output_lines = []
             continue
 
+    # Flush final question
     if current_q and len(current_q['options']) >= 2 and current_q['correct_letter']:
+        _flush(current_q)
         questions.append(finalize_q(current_q, topic, url))
     return questions
 
