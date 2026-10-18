@@ -1,3 +1,7 @@
+# Keep Cloud Run deployable. Prefer requirements.embed.txt for AWS image builds
+# (see Dockerfile). This file still installs full requirements.txt for parity
+# with the historical Cloud Run pipeline if you switch the Dockerfile COPY back.
+
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
@@ -19,8 +23,6 @@ steps:
         "--image=us-central1-docker.pkg.dev/catalyst-be/catalyst-main/embed-api:$COMMIT_SHA",
         "--region=us-central1",
         "--platform=managed",
-
-      
         "--cpu=2",
         "--memory=4Gi",
         "--concurrency=80",
@@ -28,7 +30,6 @@ steps:
         "--min-instances=0",
         "--max-instances=5",
         "--port=8080",
-
         "--no-allow-unauthenticated",
         "--set-env-vars=TORCH_NUM_THREADS=4",
         "--set-env-vars=EMBED_MODEL=sentence-transformers/all-MiniLM-L6-v2",
@@ -40,4 +41,3 @@ images:
 
 options:
   logging: CLOUD_LOGGING_ONLY
-

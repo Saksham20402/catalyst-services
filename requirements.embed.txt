@@ -1,0 +1,21 @@
+# Minimal deps for the embedding HTTP API (main.py).
+# Full requirements.txt also covers enrichment/ingestion/pipeline tooling.
+fastapi==0.115.9
+uvicorn[standard]==0.34.3
+sentence-transformers==2.6.1
+torch==2.7.1
+pydantic==2.11.5
+numpy==2.1.3
+huggingface-hub==0.33.4
+transformers==4.53.3
+safetensors==0.5.3
+tokenizers==0.21.1
+tqdm==4.67.1
+scikit-learn==1.7.0
+scipy==1.15.3
+PyYAML==6.0.2
+requests==2.32.3
+filelock==3.18.0
+fsspec==2025.3.0
+packaging==24.2
+regex==2024.11.6
